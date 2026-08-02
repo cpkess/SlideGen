@@ -1,0 +1,29 @@
+# Environment / secrets
+.env
+.env.local
+
+# Ford assets never belong in this repository
+*.potx
+*.pptx
+!tests/fixtures/*.pptx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+uv.lock
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
