@@ -20,6 +20,7 @@ from .logging_config import configure_logging
 from .render import render
 from .spec import SlideSpec
 from .template import load_catalog
+from .update import UpdateError, apply_update, check_for_update
 
 
 def _read_brief(args: argparse.Namespace) -> str:
@@ -44,6 +45,48 @@ def _describe(spec: SlideSpec, catalog, position: int) -> str:
     return "\n".join(lines)
 
 
+def _updates(settings, *, apply: bool) -> int:
+    """`--check-update` and `--update`."""
+    status = check_for_update(
+        settings.slidegen_repo, token=settings.github_token, timeout=settings.request_timeout
+    )
+    print(status.message)
+    if status.url:
+        print(status.url)
+
+    if not status.checked:
+        return 1
+    if not apply or not status.available:
+        return 0
+
+    try:
+        print(apply_update(status.latest or ""))
+    except UpdateError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _ping(settings) -> int:
+    """`--ping`: is the provider reachable, and what does it have loaded?"""
+    try:
+        models = get_provider(settings).ping()
+    except ProviderError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"{settings.llm_provider} responded.")
+    for model in models:
+        marker = " *" if model == settings.model else ""
+        print(f"  {model}{marker}")
+    if models and settings.llm_model and settings.llm_model not in models:
+        print(
+            f"warning: configured model '{settings.llm_model}' is not in that list",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slidegen",
@@ -52,6 +95,21 @@ def build_parser() -> argparse.ArgumentParser:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--brief", help="The brief text, or '-' to read stdin.")
     source.add_argument("--brief-file", help="Read the brief from a file.")
+    source.add_argument(
+        "--check-update",
+        action="store_true",
+        help="Report whether a newer release exists, then exit.",
+    )
+    source.add_argument(
+        "--update",
+        action="store_true",
+        help="Move this checkout to the latest release, then exit.",
+    )
+    source.add_argument(
+        "--ping",
+        action="store_true",
+        help="Check the provider is reachable and list its models, then exit.",
+    )
 
     parser.add_argument("--out", "-o", help="Write the .pptx here.")
     parser.add_argument(
@@ -88,6 +146,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.model:
         settings = settings.model_copy(update={"llm_model": args.model})
     count = args.candidates or settings.candidate_count
+
+    if args.check_update or args.update:
+        return _updates(settings, apply=args.update)
+
+    if args.ping:
+        return _ping(settings)
 
     brief = _read_brief(args)
     if not brief.strip():

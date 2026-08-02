@@ -28,6 +28,13 @@ class Provider(Protocol):
         """Return `n` candidate specs, each already validated against `catalog`."""
         ...
 
+    def ping(self) -> list[str]:
+        """Model ids this provider can reach. Raises `ProviderError` if it cannot.
+
+        A cheap reachability check for the UI — it must not run a generation.
+        """
+        ...
+
 
 class ProviderError(RuntimeError):
     """A provider could not produce usable candidates.

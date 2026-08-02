@@ -12,24 +12,39 @@ Two FordLLM-specific hazards are handled here and nowhere else:
 * The gateway validates request payloads against an Avro schema and answers a
   bare 500 for a null or a string where it wants a number. Payloads are stripped
   and coerced before every call.
+
+And two LM Studio ones. A local model is a weaker instruction-follower than a
+hosted frontier model, and the server in front of it is thinner:
+
+* Not every model template supports a *forced* `tool_choice`. When the server
+  rejects one, the call is retried with `"auto"` and the provider remembers.
+* Models frequently emit the tool call as text — fenced JSON, a `<tool_call>`
+  block, or a bare object — instead of populating `tool_calls`. Rather than
+  failing a generation that actually succeeded, the arguments are recovered from
+  the message content.
+
+Neither fallback weakens the schema: whatever comes back is still validated
+against the catalog before it can become a slide.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any
 
 from ..spec import SlideSpec
 from ..template import LayoutCatalog
 from .base import DEFAULT_CANDIDATES, ProviderError
-from ..retry import retry_call
+from ..retry import retry_call, status_of
 from .prompts import repair_prompt, system_prompt, user_prompt
 from .schema import TOOL_NAME, build_tool_schema
 
@@ -162,21 +177,84 @@ def _openai_client_factory(**kwargs: Any) -> Any:
     return OpenAI(**kwargs)
 
 
-def _tool_call_of(response: Any) -> Any:
-    """The `emit_candidates` call from a completion, whatever shape it arrives in."""
+@dataclass(frozen=True)
+class _Call:
+    """The tool arguments, and the call id if the server gave us a real tool call.
+
+    `id` is None when the arguments were recovered from message content: there is
+    no call to answer with a `tool` message, so the repair turn quotes the
+    assistant's text back instead.
+    """
+
+    arguments: str
+    id: str | None = None
+
+
+_TOOL_TAG = re.compile(r"<tool_call>\s*(\{.*\})\s*</tool_call>", re.DOTALL)
+_FENCED_JSON = re.compile(r"```(?:json|tool_code)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def _json_fragments(content: str) -> Iterator[str]:
+    """Plausible JSON payloads inside a text reply, most explicit first."""
+    for pattern in (_TOOL_TAG, _FENCED_JSON):
+        for match in pattern.finditer(content):
+            yield match.group(1)
+    start, end = content.find("{"), content.rfind("}")
+    if start != -1 and end > start:
+        yield content[start : end + 1]
+
+
+def arguments_from_content(content: str) -> dict[str, Any] | None:
+    """Recover `emit_candidates` arguments from a model that answered in prose.
+
+    Local models routinely describe the tool call instead of making one. The
+    payload is the same either way, so this reads it out rather than discarding a
+    generation that worked.
+    """
+    for fragment in _json_fragments(content):
+        try:
+            parsed = json.loads(fragment)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        # Either the arguments themselves, or a whole tool call wrapping them.
+        for shape in (parsed, parsed.get("arguments"), parsed.get("parameters")):
+            if isinstance(shape, dict) and isinstance(shape.get("candidates"), list):
+                return shape
+    return None
+
+
+def _extract_call(response: Any) -> _Call:
+    """The `emit_candidates` arguments from a completion, however they arrived."""
     choices = getattr(response, "choices", None) or []
     if not choices:
         raise ProviderError("The model returned no choices.")
+
     message = getattr(choices[0], "message", None)
-    tool_calls = getattr(message, "tool_calls", None) or []
-    for call in tool_calls:
-        if getattr(getattr(call, "function", None), "name", None) == TOOL_NAME:
-            return call
+    for call in getattr(message, "tool_calls", None) or []:
+        function = getattr(call, "function", None)
+        if getattr(function, "name", None) == TOOL_NAME:
+            return _Call(arguments=function.arguments, id=getattr(call, "id", None))
+
     content = (getattr(message, "content", None) or "").strip()
+    if content:
+        recovered = arguments_from_content(content)
+        if recovered is not None:
+            logger.warning("recovered tool arguments from message content")
+            return _Call(arguments=json.dumps(recovered))
+
     raise ProviderError(
         "The model replied without calling the tool"
         + (f": {content[:300]}" if content else ".")
     )
+
+
+def _rejects_forced_tool_choice(exc: BaseException) -> bool:
+    """Whether this looks like 'I do not support forcing a specific function'."""
+    if status_of(exc) not in {400, 404, 422}:
+        return False
+    return "tool" in str(exc).lower()
 
 
 class OpenAICompatibleProvider:
@@ -219,10 +297,16 @@ class OpenAICompatibleProvider:
         self._lock = threading.Lock()
         self._cached_client: Any | None = None
         self._cached_token: str | None = None
+        # Downgraded permanently for this provider once a server rejects it.
+        self._force_tool_choice = True
 
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    @property
+    def forces_tool_choice(self) -> bool:
+        return self._force_tool_choice
 
     def _credential(self) -> str:
         if self._token_fetcher is not None:
@@ -248,9 +332,49 @@ class OpenAICompatibleProvider:
                 self._cached_token = token
             return self._cached_client
 
+    def _tool_choice(self) -> Any:
+        if self._force_tool_choice:
+            return {"type": "function", "function": {"name": TOOL_NAME}}
+        return "auto"
+
     def _complete(self, payload: dict[str, Any]) -> Any:
         client = self.client()
-        return client.chat.completions.create(**clean_payload(payload))
+        try:
+            return client.chat.completions.create(
+                **clean_payload({**payload, "tool_choice": self._tool_choice()})
+            )
+        except Exception as exc:
+            if not (self._force_tool_choice and _rejects_forced_tool_choice(exc)):
+                raise
+            # Some LM Studio model templates accept `tools` but not a forced
+            # choice. Asking again with "auto" usually works, and the answer is
+            # validated either way.
+            logger.warning(
+                "server rejected a forced tool_choice; retrying with auto",
+                extra={"provider": self.name, "model": self.model},
+            )
+            self._force_tool_choice = False
+            return client.chat.completions.create(
+                **clean_payload({**payload, "tool_choice": "auto"})
+            )
+
+    def ping(self) -> list[str]:
+        """Model ids the endpoint reports. Used for the UI's connection test.
+
+        Cheaper and far more diagnostic than a trial generation: it separates
+        "cannot reach the server" from "the model is bad at tool calling", and on
+        LM Studio it names the model that is actually loaded.
+        """
+        try:
+            response = self.client().models.list()
+        except Exception as exc:
+            raise ProviderError(
+                f"{self.name} did not respond at {self._base_url}: {exc}",
+                provider=self.name,
+                cause=exc,
+            ) from exc
+        data = getattr(response, "data", None) or []
+        return [str(getattr(item, "id", item)) for item in data]
 
     def generate(
         self, brief: str, catalog: LayoutCatalog, n: int = DEFAULT_CANDIDATES
@@ -281,7 +405,6 @@ class OpenAICompatibleProvider:
                 "model": self.model,
                 "messages": messages,
                 "tools": [tool],
-                "tool_choice": {"type": "function", "function": {"name": TOOL_NAME}},
                 "temperature": self._temperature,
                 "max_tokens": self._max_tokens,
             }
@@ -293,8 +416,8 @@ class OpenAICompatibleProvider:
             )
             retries += used
 
-            call = _tool_call_of(response)
-            raw = call.function.arguments
+            call = _extract_call(response)
+            raw = call.arguments
             try:
                 arguments = json.loads(raw) if isinstance(raw, str) else raw
             except json.JSONDecodeError as exc:
@@ -304,27 +427,32 @@ class OpenAICompatibleProvider:
                     cause=exc,
                 ) from exc
 
-            # Keep the rejected call in the transcript so the repair turn has
+            # Keep the rejected answer in the transcript so the repair turn has
             # something to correct rather than something to guess at.
-            messages.append(
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": call.id,
-                            "type": "function",
-                            "function": {"name": TOOL_NAME, "arguments": raw},
-                        }
-                    ],
-                }
-            )
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": "Candidates received; validating against the template.",
-                }
-            )
+            if call.id is not None:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": call.id,
+                                "type": "function",
+                                "function": {"name": TOOL_NAME, "arguments": raw},
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": "Candidates received; validating against the template.",
+                    }
+                )
+            else:
+                # Recovered from prose: there is no tool call to answer, and a
+                # `tool` message without a matching id is itself a 400.
+                messages.append({"role": "assistant", "content": raw})
 
             candidates = arguments.get("candidates") if isinstance(arguments, dict) else None
             if not isinstance(candidates, list) or not candidates:

@@ -148,6 +148,10 @@ class MockProvider:
     def __init__(self, model: str = "mock-1") -> None:
         self.model = model
 
+    def ping(self) -> list[str]:
+        """Always reachable — it is arithmetic, not a server."""
+        return [self.model]
+
     def generate(
         self, brief: str, catalog: LayoutCatalog, n: int = DEFAULT_CANDIDATES
     ) -> list[SlideSpec]:

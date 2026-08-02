@@ -9,6 +9,7 @@ import pytest
 from pptx import Presentation
 
 from slidegen.cli import main
+from slidegen.update import UpdateError, UpdateStatus
 
 BRIEF = (
     "Connected services needs a Q3 exec summary. "
@@ -114,3 +115,101 @@ def test_overflow_warnings_go_to_stderr(tmp_path, capsys):
 def test_brief_and_brief_file_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         main(["--brief", BRIEF, "--brief-file", "x.txt"])
+
+
+def test_ping_reports_the_provider(capsys):
+    assert main(["--ping"]) == 0
+
+    out = capsys.readouterr().out
+    assert "mock responded" in out
+    assert "mock-1" in out
+
+
+def test_check_update_reports_a_newer_release(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "slidegen.cli.check_for_update",
+        lambda *a, **k: UpdateStatus(
+            current="0.1.0", latest="v0.2.0", available=True, url="https://example/v0.2.0"
+        ),
+    )
+
+    assert main(["--check-update"]) == 0
+
+    out = capsys.readouterr().out
+    assert "v0.2.0 is available" in out
+    assert "https://example/v0.2.0" in out
+
+
+def test_check_update_reports_being_current(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "slidegen.cli.check_for_update",
+        lambda *a, **k: UpdateStatus(current="0.1.0", latest="v0.1.0", available=False),
+    )
+
+    assert main(["--check-update"]) == 0
+    assert "up to date" in capsys.readouterr().out
+
+
+def test_a_failed_check_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "slidegen.cli.check_for_update",
+        lambda *a, **k: UpdateStatus(current="0.1.0", error="could not reach GitHub"),
+    )
+
+    assert main(["--check-update"]) == 1
+    assert "Could not check" in capsys.readouterr().out
+
+
+def test_check_update_never_applies_anything(monkeypatch):
+    applied = []
+    monkeypatch.setattr(
+        "slidegen.cli.check_for_update",
+        lambda *a, **k: UpdateStatus(current="0.1.0", latest="v0.2.0", available=True),
+    )
+    monkeypatch.setattr("slidegen.cli.apply_update", lambda *a, **k: applied.append(a))
+
+    main(["--check-update"])
+
+    assert applied == []
+
+
+def test_update_applies_when_one_is_available(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "slidegen.cli.check_for_update",
+        lambda *a, **k: UpdateStatus(current="0.1.0", latest="v0.2.0", available=True),
+    )
+    monkeypatch.setattr("slidegen.cli.apply_update", lambda tag, **k: f"Updated to {tag}.")
+
+    assert main(["--update"]) == 0
+    assert "Updated to v0.2.0." in capsys.readouterr().out
+
+
+def test_update_does_nothing_when_already_current(monkeypatch):
+    applied = []
+    monkeypatch.setattr(
+        "slidegen.cli.check_for_update",
+        lambda *a, **k: UpdateStatus(current="0.2.0", latest="v0.2.0", available=False),
+    )
+    monkeypatch.setattr("slidegen.cli.apply_update", lambda *a, **k: applied.append(a))
+
+    assert main(["--update"]) == 0
+    assert applied == []
+
+
+def test_a_refused_update_exits_nonzero(monkeypatch, capsys):
+    def refuse(*_a, **_k):
+        raise UpdateError("There are uncommitted changes in the working tree.")
+
+    monkeypatch.setattr(
+        "slidegen.cli.check_for_update",
+        lambda *a, **k: UpdateStatus(current="0.1.0", latest="v0.2.0", available=True),
+    )
+    monkeypatch.setattr("slidegen.cli.apply_update", refuse)
+
+    assert main(["--update"]) == 1
+    assert "uncommitted changes" in capsys.readouterr().err
+
+
+def test_update_flags_are_mutually_exclusive_with_a_brief():
+    with pytest.raises(SystemExit):
+        main(["--brief", BRIEF, "--check-update"])

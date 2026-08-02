@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     request_timeout: float = Field(default=60.0, gt=0)
     max_retries: int = Field(default=3, ge=0, le=8)
 
+    # Updates, from GitHub Releases
+    slidegen_repo: str = "cpkess/SlideGen"
+    slidegen_update_check: bool = True
+    slidegen_update_ttl: float = Field(default=86_400.0, ge=60.0)
+    github_token: str | None = None
+
     @property
     def model(self) -> str:
         """Model id for the active provider, falling back to a per-provider default."""

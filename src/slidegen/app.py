@@ -27,6 +27,8 @@ from slidegen.logging_config import configure_logging
 from slidegen.render import render
 from slidegen.spec import SlideSpec, validate_spec
 from slidegen.template import BUILT_IN, LayoutCatalog, load_catalog
+from slidegen.update import UpdateError, apply_update, cached_check
+from slidegen.update import reset_cache as reset_update_cache
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -170,24 +172,68 @@ def _sidebar(settings: Settings) -> None:
 
         st.caption(f"Candidates per run: {settings.candidate_count}")
 
+        _update_notice(settings)
+
 
 def _test_connection(settings: Settings) -> None:
-    try:
-        _, catalog = _catalog()
-    except FileNotFoundError as exc:
-        st.error(str(exc))
-        return
+    """Reachability only — deliberately not a trial generation.
 
+    On LM Studio a generation can take a minute and fail for reasons that have
+    nothing to do with the connection. Listing models separates the two, and
+    names the model that is actually loaded.
+    """
     try:
-        provider = get_provider(settings)
-        provider.generate("Connection test. Confirm the provider responds.", catalog, 1)
+        models = get_provider(settings).ping()
     except ProviderError as exc:
         st.error(str(exc))
+        return
     except Exception as exc:  # noqa: BLE001 — a traceback in the UI helps nobody
         logger.exception("connection test failed")
         st.error(f"{settings.llm_provider} did not respond: {exc}")
-    else:
-        st.success(f"{settings.llm_provider} responded ({settings.model}).")
+        return
+
+    st.success(f"{settings.llm_provider} responded.")
+    if models:
+        st.caption("Models available:")
+        st.code("\n".join(models[:20]), language=None)
+        if settings.llm_model and settings.llm_model not in models:
+            st.warning(
+                f"`{settings.llm_model}` is not in that list. The server may "
+                "reject it, or load a different model than you expect."
+            )
+
+
+def _update_notice(settings: Settings) -> None:
+    """Tell the user about a newer release. Never blocks, never self-applies."""
+    if not settings.slidegen_update_check:
+        return
+
+    status = cached_check(
+        settings.slidegen_repo,
+        ttl=settings.slidegen_update_ttl,
+        token=settings.github_token,
+    )
+    st.divider()
+
+    if not status.checked:
+        st.caption(f"SlideGen {status.current} · {status.error}")
+        return
+    if not status.available:
+        st.caption(f"SlideGen {status.current} · up to date")
+        return
+
+    st.info(f"**{status.latest}** is available (you have {status.current}).")
+    if status.url:
+        st.caption(f"[Release notes]({status.url})")
+    if st.button("Update and restart", use_container_width=True):
+        try:
+            with st.spinner("Updating…"):
+                message = apply_update(status.latest or "")
+        except UpdateError as exc:
+            st.error(str(exc))
+        else:
+            reset_update_cache()
+            st.success(message)
 
 
 # --- header ----------------------------------------------------------------

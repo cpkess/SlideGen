@@ -89,6 +89,10 @@ docker run -p 8501:8501 \
 | `CANDIDATE_COUNT` | `3` | no | Candidates per generation (1–6) |
 | `REQUEST_TIMEOUT` | `60` | no | Seconds per upstream request |
 | `MAX_RETRIES` | `3` | no | Total attempts per request, including the first |
+| `SLIDEGEN_REPO` | `cpkess/SlideGen` | no | Repository checked for releases |
+| `SLIDEGEN_UPDATE_CHECK` | `true` | no | `false` stops the app contacting GitHub entirely |
+| `SLIDEGEN_UPDATE_TTL` | `86400` | no | Seconds between update checks |
+| `GITHUB_TOKEN` | — | no | Private repo, or to raise the unauthenticated rate limit |
 
 A provider only appears in the UI when its configuration is complete —
 `Settings.enabled_providers()` is the single source of that truth, so a
@@ -98,10 +102,22 @@ half-configured FordLLM is invisible rather than broken.
 
 ```bash
 python scripts/inspect_template.py       # the template loads, and its layouts
-slidegen --brief "Test." --list          # the provider answers
+slidegen --ping                          # the provider is reachable, and its models
+slidegen --brief "Test." --list          # a full generation round-trips
+slidegen --check-update                  # GitHub is reachable, if updates are on
 ```
 
-The sidebar's **Test connection** button does the same thing from the UI.
+`--ping` is reachability only; it deliberately does not run a generation, so a
+failure means the network or the URL, never the model. The sidebar's **Test
+connection** button does the same thing.
+
+### Cutting a release
+
+The updater reads GitHub Releases, so it only sees versions that have one. To
+publish: bump `version` in `pyproject.toml` and `__version__` in
+`src/slidegen/__init__.py`, tag `vX.Y.Z`, push the tag, and create a release
+against it. Tags that do not parse as `vX.Y.Z` are ignored by the checker, and a
+pre-release suffix never presents itself as an upgrade over the plain version.
 
 ## Security posture
 
@@ -112,9 +128,17 @@ message of a chat completion, together with the system prompt and the tool
 schema. The tool schema contains the loaded template's **layout names and
 placeholder names** — worth knowing if those names are themselves sensitive.
 
-Nothing else is transmitted. The template file is never uploaded; it is read
-locally and only its structure informs the prompt. The generated `.pptx` is built
-locally from the model's text.
+Nothing else is transmitted to the model. The template file is never uploaded; it
+is read locally and only its structure informs the prompt. The generated `.pptx`
+is built locally from the model's text.
+
+**One other outbound connection exists:** the update check, an unauthenticated
+`GET https://api.github.com/repos/{SLIDEGEN_REPO}/releases/latest`, at most once
+per `SLIDEGEN_UPDATE_TTL`. It sends no brief, no template data and no
+credentials — only the request itself, which reveals to GitHub that this IP runs
+SlideGen. Set `SLIDEGEN_UPDATE_CHECK=false` to remove it. If a security review
+asks "what does this talk to", the answer is the configured gateway, Entra ID for
+the token, and — unless disabled — api.github.com.
 
 ### Data tier
 
@@ -143,6 +167,26 @@ in code, tests, fixtures or commit messages. `.gitignore` excludes `*.potx` and
 `*.pptx` so a template cannot be committed by accident. Development and CI run
 against the `python-pptx` built-in template, which exercises every code path.
 
+### Updating
+
+Updating executes code fetched from GitHub on a machine that handles secret-tier
+briefs. That is a supply-chain surface, and it is treated as one:
+
+- **Checking and applying are separate.** The check is read-only and automatic;
+  applying is not. Nothing updates itself, on any schedule, ever.
+- **Applying is a `git checkout` of a release tag**, after `git fetch --tags`. It
+  refuses on a dirty working tree rather than discarding local changes, and
+  refuses outright if this is not a git checkout, pointing at `pip install
+  --upgrade` instead.
+- **A restart is required.** Python will not reload a running process, so the new
+  code is not live until someone restarts it — which is also the last chance to
+  reconsider.
+- **Whoever can push a tag to `SLIDEGEN_REPO` can supply code to every instance**
+  that someone then clicks *Update* on. If that repository is public, so is that
+  trust boundary. Restrict tag-push permissions, or set
+  `SLIDEGEN_UPDATE_CHECK=false` and update through your normal deployment
+  process.
+
 ### Logging
 
 Structured JSON to stdout, one object per line: request id, provider, model,
@@ -159,6 +203,10 @@ reason. If you add logging, keep it to metadata.
 | Proxy errors on the network | `HTTPS_PROXY` unset for the process. Both the SDK and the AAD token fetch read it from the environment. |
 | "does not fit the template" | The model chose a placeholder idx from another layout twice running. The validation errors in the message say exactly which. |
 | Text overflows the slide | Expected: the guard warns, it does not block. The template's autofit decides what actually happens. |
+| LM Studio: "replied without calling the tool" | The loaded model has no tool-use template. SlideGen recovers a call written as text, but a model that emits neither cannot be used — load one with tool support. |
+| LM Studio: named tool choice rejected | Handled: the call is retried with `tool_choice="auto"` and the downgrade is remembered. Visible in the logs as a warning. |
+| LM Studio: model not found | `slidegen --ping` lists what the server actually has; `LLM_MODEL` must match one of those ids. |
+| "Could not check for updates" | Informational. GitHub is unreachable, rate-limited, or the repo has no releases. It never blocks generation. |
 
 ## Operating notes
 
